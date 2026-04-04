@@ -1,0 +1,138 @@
+name: Build geoip files
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3,9,15,21 * * *"
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - ".gitignore"
+      - "LICENSE*"
+      - "*.md"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0https://github.com/el-dorian-global/geoip
+
+      - name: Checkout runetfreedom geoip
+        uses: actions/checkout@v4
+        with:
+          repository: runetfreedom/geoip
+          path: geoip
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ./geoip/go.mod
+
+      - name: Set variables
+        run: |
+          echo "TAG_NAME=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+          echo "RELEASE_NAME=$(date +%Y%m%d%H%M)" >> $GITHUB_ENV
+
+      - name: Prepare whitelist
+        run: |
+          curl -L https://raw.githubusercontent.com/hxehex/russia-mobile-internet-whitelist/main/ipwhitelist.txt -o geoip/ips.txt
+          wc -l geoip/ips.txt
+          echo "Downloaded whitelist..."
+          echo "Lines in whitelist:"
+          wc -l geoip/ips.txt
+          echo "First 5 lines:"
+          head -n 5 geoip/ips.txt
+
+      - name: Inject mobile whitelist
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+          cp config.json geoip/config.json
+          cp ips.txt geoip/ips.txt
+
+          jq '.input += [{
+            "type": "text",
+            "action": "add",
+            "args": {
+              "name": "mob-whitelist",
+              "uri": "./ips.txt"
+            }
+          }] |
+          (.output[] | select(.args.wantedList != null) | .args.wantedList) += ["mob-whitelist"]' \
+          geoip/config.json > geoip/config-new.json
+
+          mv geoip/config-new.json geoip/config.json
+
+      - name: Build geoip generator
+        run: |
+          cd geoip
+          go build -o ../geoip-bin ./
+
+      - name: Build geoip databases
+        run: |
+          cd geoip
+          ls -lah
+          ../geoip-bin convert -c config.json
+
+      - name: Verify mmdb files
+        run: |
+          go install github.com/maxmind/mmdbverify@latest
+          for name in ./geoip/output/*.mmdb; do
+            [ -f "$name" ] || continue
+            $(go env GOPATH)/bin/mmdbverify -file "${name}"
+          done
+
+      - name: Generate sha256 checksums
+        run: |
+          cd geoip/output
+          for name in *.dat *.mmdb; do
+            [ -f "$name" ] || continue
+            sha256sum "${name}" > "${name}.sha256sum"
+          done
+
+      - name: Remove temporary files
+        run: |
+          rm -f ./geoip/output/*.gz ./geoip/output/*.zip || true
+          rm -rf ./geoip/output/GeoLite2-* || true
+          rm -rf ./geoip/output/{clash,dat,mrs,nginx,srs,surge,text} || true
+
+      - name: Git push assets to release branch
+        run: |
+          cd geoip/output
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b release
+          git add -A
+          git commit -m "${{ env.RELEASE_NAME }}"
+
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}"
+          git push -f origin release
+
+      - name: Upload files to GitHub release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file_glob: true
+          file: ./geoip/output/*
+          release_name: ${{ env.RELEASE_NAME }}
+          tag: ${{ env.TAG_NAME }}
+          overwrite: true
+
+      - name: Purge jsdelivr CDN
+        run: |
+          cd geoip/output
+          for file in *; do
+            [ -f "$file" ] || continue
+            curl -s "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/${file}" || true
+          done
